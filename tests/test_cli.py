@@ -32,7 +32,7 @@ class FakeChatClient:
     def __init__(self, config: AgentConfig) -> None:
         pass
 
-    def complete(self, messages):
+    def complete(self, messages, tools=None):
         return "response"
 
 

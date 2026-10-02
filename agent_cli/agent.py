@@ -7,12 +7,17 @@ from typing import Callable, Protocol
 
 from .config import AgentConfig
 from .knowledge import ErrorKnowledgeBase
+from .llm import ChatCompletionResult, ChatToolCall, ToolCallingUnsupported
 from .tools import ToolError, ToolManager
 from .workspace import WorkspaceApprovalDenied, WorkspaceError, WorkspaceTools
 
 
 class CompletionClient(Protocol):
-    def complete(self, messages: list[dict[str, str]]) -> str: ...
+    def complete(
+        self,
+        messages: list[dict[str, object]],
+        tools: list[dict[str, object]] | None = None,
+    ) -> ChatCompletionResult | str: ...
 
 
 class AgentError(RuntimeError):
@@ -27,20 +32,14 @@ class PendingToolFailure:
 
 SYSTEM_PROMPT = """You are a terminal coding agent. Use only the agent-managed tools listed below.
 You are allowed to create or repair tools. A tool itself cannot create or register tools.
-For project tasks, use these internal workspace actions; they do not create generated tools:
-{{"type":"list_files","path":".","recursive":true}}
-{{"type":"read_file","path":"relative/path"}}
-{{"type":"write_file","path":"relative/path","content":"complete file content"}}
-{{"type":"run_command","command":["python","-m","pytest"],"cwd":".","timeout_seconds":120}}
+For project tasks, call the provided workspace functions to list/read/write files or run commands.
+Use native function tool calls; never print a tool request as prose, a JSON example, or a code block.
 Use paths relative to the active workspace when possible. Commands are argument arrays, not shell
 commands; do not use pipes, command chaining, or shell syntax. File operations outside the active
 workspace and commands outside the development-check allowlist will trigger a user approval prompt.
 Never claim that a denied operation was performed.
-When a generated tool is needed, answer with exactly one JSON object:
-{{"type":"create_tool","name":"snake_case_name","description":"...","source":"Python source"}}
-{{"type":"run_tool","name":"existing_tool","input":{{}}}}
-{{"type":"repair_tool","name":"existing_tool","description":"...","source":"complete replacement Python source"}}
-For a normal response, answer with plain text. Generated source must define run(input_data),
+When a generated tool is needed, call the matching generated-tool function. For a normal completed
+task, answer the user with plain text. Generated source must define run(input_data),
 return a JSON-serializable value, use only allowlisted standard-library imports, and avoid
 filesystem, network, process, and shell access. If tool validation or execution fails, diagnose
 the supplied error and repair the existing tool where appropriate. Do not claim success unless
@@ -54,6 +53,130 @@ Active workspace:
 
 Relevant stored knowledge:
 {knowledge}
+"""
+
+ACTION_TOOL_SCHEMAS: list[dict[str, object]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "List files in the active workspace or a subdirectory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "default": "."},
+                    "recursive": {"type": "boolean", "default": True},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a UTF-8 text file from the workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Create or replace a UTF-8 text file in the workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": "Run a development command as an argument array, without a shell.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "cwd": {"type": "string", "default": "."},
+                    "timeout_seconds": {"type": "number"},
+                },
+                "required": ["command"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_tool",
+            "description": "Create a generated Python tool. Tools cannot create tools.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "source": {"type": "string"},
+                },
+                "required": ["name", "description", "source"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "repair_tool",
+            "description": "Replace the implementation of an existing generated Python tool.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "source": {"type": "string"},
+                },
+                "required": ["name", "description", "source"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_tool",
+            "description": "Run a previously created generated Python tool.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "input": {},
+                },
+                "required": ["name", "input"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+FALLBACK_PROTOCOL = """Native tool calls are unavailable for this response. Use this strict JSON-only
+protocol, with no prose or Markdown fences:
+For an action: {"type":"action","action":{"type":"list_files|read_file|write_file|run_command|create_tool|repair_tool|run_tool",...}}
+For a final answer: {"type":"final","content":"Your answer to the user"}
+Never include an action JSON object inside explanatory prose. The action result will be returned
+to you, and you must choose the next action or provide a final answer based on that actual result.
 """
 
 KNOWN_ACTIONS = {
@@ -89,9 +212,10 @@ class Agent:
         self.workspace = workspace
         self.progress = progress or (lambda _message: None)
         self.max_actions_per_turn = max_actions_per_turn
-        self._history: list[dict[str, str]] = []
+        self._history: list[dict[str, object]] = []
         self._pending_failures: dict[str, PendingToolFailure] = {}
         self._turn_count = 0
+        self._native_tool_calling_supported: bool | None = None
 
     @property
     def turn_count(self) -> int:
@@ -135,11 +259,30 @@ class Agent:
         )
         self._history.append({"role": "user", "content": user_text})
         messages = [{"role": "system", "content": system_message}, *self._history]
+        use_native_tools = self._native_tool_calling_supported is not False
+        fallback_prompt_added = not use_native_tools
+        approval_denied = False
+        action_count = 0
+        if fallback_prompt_added:
+            messages.append({"role": "system", "content": FALLBACK_PROTOCOL})
 
         for _ in range(self.max_actions_per_turn):
             try:
                 self.progress("Waiting for model response")
-                response = self.completion_client.complete(messages)
+                completion = self.completion_client.complete(
+                    messages,
+                    tools=ACTION_TOOL_SCHEMAS if use_native_tools else None,
+                )
+            except ToolCallingUnsupported:
+                self._native_tool_calling_supported = False
+                use_native_tools = False
+                if not fallback_prompt_added:
+                    messages.append({"role": "system", "content": FALLBACK_PROTOCOL})
+                    fallback_prompt_added = True
+                self.progress(
+                    "Native tool calls are unavailable; switching to the strict JSON action protocol"
+                )
+                continue
             except Exception as exc:
                 self._record_error(
                     error=f"Chat completion failed: {type(exc).__name__}: {exc}",
@@ -147,65 +290,293 @@ class Agent:
                 )
                 raise AgentError(f"Chat completion failed: {exc}") from exc
 
+            if isinstance(completion, str):
+                completion = ChatCompletionResult(content=completion)
+            if completion.tool_calls:
+                if approval_denied:
+                    raise AgentError(
+                        "The task was paused because an operation was denied. "
+                        "The model attempted another action after the denial; no further action was run."
+                    )
+                if action_count + len(completion.tool_calls) > self.max_actions_per_turn:
+                    message = (
+                        f"The task requested more than {self.max_actions_per_turn} actions "
+                        "before completion."
+                    )
+                    self._record_error(message, f"User request: {user_text}")
+                    raise AgentError(message)
+                action_count += len(completion.tool_calls)
+                assistant_message = completion.as_assistant_message()
+                messages.append(assistant_message)
+                self._history.append(assistant_message)
+                for tool_call in completion.tool_calls:
+                    if approval_denied:
+                        result = json.dumps(
+                            {
+                                "ok": False,
+                                "error": "Not run because an earlier action in this task was denied.",
+                            },
+                            ensure_ascii=False,
+                        )
+                        denied = False
+                    else:
+                        try:
+                            action = self._action_from_tool_call(tool_call)
+                            result, denied = self._execute_action(action, user_text)
+                        except (ValueError, TypeError, KeyError) as exc:
+                            self._record_error(
+                                f"Invalid structured tool call: {type(exc).__name__}: {exc}",
+                                f"User request: {user_text}\nTool call: {tool_call!r}",
+                            )
+                            result = self._format_action_error(exc)
+                            denied = False
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": result,
+                        }
+                    )
+                    self._history.append(messages[-1])
+                    approval_denied = approval_denied or denied
+                if approval_denied:
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "A requested action was denied by the user. Do not request or "
+                                "perform any more actions in this task. Explain that the task "
+                                "is incomplete and identify the denied operation."
+                            ),
+                        }
+                    )
+                    use_native_tools = False
+                continue
+
+            response = completion.content or ""
             messages.append({"role": "assistant", "content": response})
             self._history.append({"role": "assistant", "content": response})
-            action = self._parse_action(response)
-            if action is None:
-                return response
+            parsed = self._parse_structured_response(response)
+            if parsed is not None:
+                kind, payload = parsed
+                if kind == "final":
+                    return payload
+                if approval_denied:
+                    raise AgentError(
+                        "The task was paused because an operation was denied. "
+                        "The model attempted another action after the denial; no further action was run."
+                    )
+                action_count += 1
+                if action_count > self.max_actions_per_turn:
+                    message = (
+                        f"The task requested more than {self.max_actions_per_turn} actions "
+                        "before completion."
+                    )
+                    self._record_error(message, f"User request: {user_text}")
+                    raise AgentError(message)
+                try:
+                    action = payload
+                    result, denied = self._execute_action(action, user_text)
+                except (ValueError, TypeError, KeyError) as exc:
+                    result = self._format_action_error(exc)
+                    denied = False
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "type": "action_result",
+                                "ok": self._result_is_success(result),
+                                "result": result,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                )
+                self._history.append(messages[-1])
+                approval_denied = approval_denied or denied
+                if approval_denied:
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "The user denied an action. Do not request or perform another "
+                                "action. Return a final response explaining that the task is incomplete."
+                            ),
+                        }
+                    )
+                continue
 
-            try:
-                if action.get("type") == "run_command":
-                    command = action.get("command")
-                    if isinstance(command, list) and command:
-                        self.progress("Running project command")
-                elif action.get("type") == "list_files":
-                    self.progress("Listing workspace files")
-                elif action.get("type") == "read_file":
-                    self.progress("Reading workspace file")
-                elif action.get("type") == "write_file":
-                    self.progress("Writing workspace file")
-                result = self._run_action(action)
-            except WorkspaceApprovalDenied as exc:
-                result = (
-                    f"Action denied by user: {exc}. Do not repeat this action unless "
-                    "the user explicitly requests and approves it."
+            if approval_denied:
+                return response
+            if self._contains_embedded_action(response):
+                if use_native_tools:
+                    self._native_tool_calling_supported = False
+                    use_native_tools = False
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "The previous reply contained prose and an action-looking JSON "
+                                "fragment. No action was executed. Return actions only as a "
+                                "strict JSON protocol response.\n" + FALLBACK_PROTOCOL
+                            ),
+                        }
+                    )
+                    fallback_prompt_added = True
+                    self.progress(
+                        "The model returned an unstructured action; requesting a strict JSON action"
+                    )
+                    continue
+                message = (
+                    "The model included an action in plain text instead of returning a structured "
+                    "tool call. The task is incomplete; choose a provider/model that supports "
+                    "tool calling or returns the strict JSON action protocol."
                 )
-            except (ToolError, WorkspaceError, OSError, ValueError, KeyError, TypeError) as exc:
-                tool_name = self._optional_string(action.get("name")) or "unknown"
-                context = (
-                    f"User request: {user_text}\n"
-                    f"Action: {json.dumps(action, ensure_ascii=False)}\n"
-                    f"Failure: {type(exc).__name__}: {exc}"
-                )
-                knowledge_id = self._record_error(str(exc), context)
-                previous = self._pending_failures.get(tool_name)
-                failed_input = (
-                    action.get("input")
-                    if action.get("type") == "run_tool" and "input" in action
-                    else previous.input_data if previous is not None else None
-                )
-                existing_ids = (
-                    previous.knowledge_ids if previous is not None else ()
-                )
-                self._pending_failures[tool_name] = PendingToolFailure(
-                    (*existing_ids, knowledge_id),
-                    failed_input,
-                )
-                result = (
-                    f"Tool action failed: {type(exc).__name__}: {exc}. "
-                    "The failure has been recorded. Diagnose it and, if applicable, "
-                    "return a repair_tool action."
-                )
-            feedback = {"role": "user", "content": result}
-            messages.append(feedback)
-            self._history.append(feedback)
+                self._record_error(message, f"User request: {user_text}\nResponse: {response}")
+                raise AgentError(message)
+            if use_native_tools:
+                return response
+            message = (
+                "The provider did not return the required strict JSON action/final response. "
+                "The task is incomplete; no unstructured action text was executed."
+            )
+            self._record_error(message, f"User request: {user_text}\nResponse: {response}")
+            raise AgentError(message)
 
         message = (
             f"The agent reached the limit of {self.max_actions_per_turn} actions "
-            "without producing a final response."
+            "before the task was completed."
         )
         self._record_error(message, f"User request: {user_text}")
         raise AgentError(message)
+
+    def _execute_action(
+        self,
+        action: dict[str, object],
+        user_text: str,
+    ) -> tuple[str, bool]:
+        try:
+            action_type = action.get("type")
+            if action_type == "run_command":
+                self.progress("Running project command")
+            elif action_type == "list_files":
+                self.progress("Listing workspace files")
+            elif action_type == "read_file":
+                self.progress("Reading workspace file")
+            elif action_type == "write_file":
+                self.progress("Writing workspace file")
+            value = self._run_action(action)
+            return json.dumps({"ok": True, "result": value}, ensure_ascii=False), False
+        except WorkspaceApprovalDenied as exc:
+            return (
+                json.dumps(
+                    {"ok": False, "error": f"Action denied by user: {exc}"},
+                    ensure_ascii=False,
+                ),
+                True,
+            )
+        except (ToolError, WorkspaceError, OSError, ValueError, KeyError, TypeError) as exc:
+            self._record_action_error(action, user_text, exc)
+            return self._format_action_error(exc), False
+
+    def _record_action_error(
+        self,
+        action: dict[str, object],
+        user_text: str,
+        error: Exception,
+    ) -> None:
+        context = (
+            f"User request: {user_text}\n"
+            f"Action: {json.dumps(action, ensure_ascii=False)}\n"
+            f"Failure: {type(error).__name__}: {error}"
+        )
+        knowledge_id = self._record_error(str(error), context)
+        if action.get("type") not in {"create_tool", "repair_tool", "run_tool"}:
+            return
+        tool_name = self._optional_string(action.get("name")) or "unknown"
+        previous = self._pending_failures.get(tool_name)
+        failed_input = (
+            action.get("input")
+            if action.get("type") == "run_tool" and "input" in action
+            else previous.input_data if previous is not None else None
+        )
+        existing_ids = previous.knowledge_ids if previous is not None else ()
+        self._pending_failures[tool_name] = PendingToolFailure(
+            (*existing_ids, knowledge_id),
+            failed_input,
+        )
+
+    @staticmethod
+    def _format_action_error(error: Exception) -> str:
+        return json.dumps(
+            {
+                "ok": False,
+                "error": f"{type(error).__name__}: {error}",
+                "recorded": True,
+            },
+            ensure_ascii=False,
+        )
+
+    @staticmethod
+    def _result_is_success(result: str) -> bool:
+        try:
+            decoded = json.loads(result)
+        except json.JSONDecodeError:
+            return False
+        return isinstance(decoded, dict) and decoded.get("ok") is True
+
+    @classmethod
+    def _action_from_tool_call(cls, call: ChatToolCall) -> dict[str, object]:
+        if call.name not in KNOWN_ACTIONS:
+            raise ValueError(f"Unsupported tool name: {call.name!r}.")
+        try:
+            arguments = json.loads(call.arguments)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Tool arguments are not valid JSON: {exc}") from exc
+        if not isinstance(arguments, dict):
+            raise ValueError("Tool arguments must be a JSON object.")
+        return {"type": call.name, **arguments}
+
+    @classmethod
+    def _parse_structured_response(
+        cls,
+        response: str,
+    ) -> tuple[str, dict[str, object] | str] | None:
+        try:
+            decoded = json.loads(response)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(decoded, dict):
+            return None
+        if decoded.get("type") == "final":
+            content = decoded.get("content")
+            if not isinstance(content, str):
+                raise AgentError("The structured final response must contain string content.")
+            return "final", content
+        if decoded.get("type") == "action":
+            action = decoded.get("action")
+            if not isinstance(action, dict) or action.get("type") not in KNOWN_ACTIONS:
+                raise AgentError("The structured action response contains an invalid action.")
+            return "action", action
+        if decoded.get("type") in KNOWN_ACTIONS:
+            return "action", decoded
+        return None
+
+    @staticmethod
+    def _contains_embedded_action(response: str) -> bool:
+        action_names = "|".join(sorted(KNOWN_ACTIONS))
+        pattern = re.compile(
+            rf'"type"\s*:\s*"(?:{action_names})"',
+            flags=re.IGNORECASE,
+        )
+        if not pattern.search(response):
+            return False
+        try:
+            json.loads(response)
+        except json.JSONDecodeError:
+            return True
+        return False
 
     def _run_action(self, action: dict[str, object]) -> str:
         action_type = action.get("type")
