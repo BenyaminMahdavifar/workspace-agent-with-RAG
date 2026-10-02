@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "full-agent"
+version = "0.1.0"
+description = "Interactive CLI agent with OpenAI-compatible chat, local Hugging Face RAG, and agent-built tools"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.40",
+    "huggingface_hub>=0.24",
+    "sentence-transformers>=3.0",
+    "torch>=2.14.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+full-agent = "agent_cli.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["agent_cli*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
