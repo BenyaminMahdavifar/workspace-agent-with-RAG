@@ -1,4 +1,4 @@
-# Full Agent
+# workspace-agent
 
 An interactive Python coding agent for OpenAI-compatible Chat Completions APIs. It provides a command-line interface, workspace file operations, development command execution, generated Python tools, Markdown error knowledge, and local embedding-based retrieval augmented generation (RAG).
 
